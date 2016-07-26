@@ -5,7 +5,6 @@
             [taoensso.encore  :as enc]
             [taoensso.carmine :as car]
             [taoensso.carmine
-             (utils       :as utils)
              (protocol    :as protocol)
              (connections :as conns)
              (commands    :as commands)]))

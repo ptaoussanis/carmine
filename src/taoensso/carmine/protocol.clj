@@ -20,6 +20,8 @@
 ;;   received, parsed, + returned.
 
 ;;;; Dynamic context
+;; TODO Could do with a design refactor
+;; (deftype Context [conn req-queue parser]) ; TODO, use .-fields
 
 (defrecord Context [conn req-queue])
 (def ^:dynamic *context* "Current dynamic Context"         nil)
