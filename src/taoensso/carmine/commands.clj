@@ -1,11 +1,10 @@
 (ns taoensso.carmine.commands
   "Macros to define an up-to-date, fully documented function for every Redis
   command as specified in the official json command spec."
-  {:author "Peter Taoussanis (@ptaoussanis)"}
   (:require [clojure.string  :as str]
             [taoensso.encore :as enc]
             [taoensso.carmine.protocol :as protocol])
-  (:import  [taoensso.carmine.protocol Context]))
+  (:import  [taoensso.carmine.protocol EnqueuedRequest Context]))
 
 ;;;; Cluster keyslots
 
@@ -172,7 +171,7 @@
                     :fn-params-more ; ?'[key value & args]
                     (when fn-params-more?
                       (into fn-params-fixed '[& args]))
-
+                    ;; :cmd-args cmd-args ; ["CONFIG" "SET"]
                     :req-args-fixed ; ["CONFIG" "SET" 'key 'value]
                     (into cmd-args fn-params-fixed)
 
@@ -188,13 +187,11 @@
   (comment (spit "commands.edn" (enc/pr-edn (get-command-spec)))))
 
 ;;;;
-;; TODO Requests could do with a design refactor
-;; (deftype EnqueuedRequest [parser cluster-keyslot request-bs]) ; TODO
 
 (defn enqueue-request
   "Implementation detail.
   Takes a request like [\"SET\" \"my-key\" \"my-val\"] and adds it to
-  context's request queue with relevant metadata from dynamic environment."
+  dynamic context's request queue."
   ([cluster-key-idx request more-args]
    (enqueue-request cluster-key-idx
      (reduce conj request more-args) ; Avoid transients
@@ -204,34 +201,25 @@
    ;; (enc/have? vector? request)
    (let [context protocol/*context*
          _ (when (nil? context) (throw protocol/no-context-ex))
-         conn      (.-conn      ^Context context)
-         req-queue (.-req-queue ^Context context)
-         parser protocol/*parser*
+         ^Context context context
+         conn          (.-conn      context)
+         req-queue     (.-req-queue context)
+         parser        (.-parser    context)
+         ;; cluster-mode? (.-cluster-mode? context)
+         cluster-mode? false #_(get-in conn [:spec :cluster])
+
          request-bs (mapv protocol/byte-str request)
+         cluster-keyslot
+         (if cluster-mode?
+           (let [ck (nth request cluster-key-idx)]
+             (if (string? ck)
+               (keyslot ck)
+               (keyslot (nth request-bs cluster-key-idx))))
+           0)
 
-         cluster-keyslot 1
-         ;; TODO For cluster support; calculate only when in cluster context:
-         ;; (if (get-in conn [:spec :cluster])
-         ;;   (let [ck (nth request cluster-key-idx)]
-         ;;     (if (string? ck)
-         ;;       (keyslot ck)
-         ;;       (keyslot (nth request-bs cluster-key-idx))))
-         ;;   1)
+         ereq (EnqueuedRequest. cluster-keyslot parser request request-bs)]
 
-         request ; User-readable request, handy for debugging
-         (with-meta request
-           {:parser           parser
-            :expected-keyslot cluster-keyslot
-            :bytestring-req   request-bs})]
-
-     ;; Could also choose to throw for non-Cluster commands in Cluster mode?
-     ;; Choosing for now to let Redis server reply with the relevant error
-     ;; since there's no command spec info on which commands do/don't support
-     ;; cluster.
-
-     ;; (println "Enqueue request: " request#)
-     (swap! req-queue (fn [[_ q]] [nil (conj q request)])) ; TODO Optimize
-     )))
+     (swap! req-queue conj ereq))))
 
 ;;;;
 
@@ -241,6 +229,9 @@
 (defmacro defcommand [cmd-name spec]
   (let [{:keys [fn-name fn-docstring fn-params-fixed fn-params-more
                 req-args-fixed cluster-key-idx]} spec]
+
+    ;; TODO Optimization: could pre-generate raw byte-strings for req
+    ;; cmd args, e.g. ["CONFIG" "SET"]?
 
     (when-not (skip-fns fn-name)
       (let [fn-name (get rename-fns fn-name fn-name)]

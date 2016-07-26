@@ -1,43 +1,29 @@
 (ns taoensso.carmine.protocol
   "Core facilities for communicating with Redis servers using the Redis
-  request/response protocol, Ref. http://redis.io/topics/protocol"
-  {:author "Peter Taoussanis"}
+  request/response protocol, Ref. http://redis.io/topics/protocol."
   (:require [clojure.string       :as str]
             [taoensso.encore      :as enc]
             [taoensso.nippy.tools :as nippy-tools])
   (:import  [java.io DataInputStream BufferedOutputStream]
             [clojure.lang Keyword]))
 
-;;; Outline (Carmine v3+)
-;; * Dynamic context is established with `carmine/wcar`.
-;; * Commands executed w/in this context push their requests (vectors) into
-;;   context's request queue. Requests may have metadata for Cluster keyslots
-;;   and parsers. Parsers may have metadata as a convenient+composable way of
-;;   communicating special request requirements (:raw-bulk?, :thaw-opts, etc.).
-;; * On `with-reply`, nested `wcar`, or `execute-requests` - queued requests
-;;   will actually be sent to server as pipeline.
-;; * For non-listener modes, corresponding replies will then immediately be
-;;   received, parsed, + returned.
+;;;; Context
 
-;;;; Dynamic context
-;; TODO Could do with a design refactor
-;; (deftype Context [conn req-queue parser]) ; TODO, use .-fields
-
-(defrecord Context [conn req-queue])
-(def ^:dynamic *context* "Current dynamic Context"         nil)
-(def ^:dynamic *parser*  "ifn (with optional meta) or nil" nil)
-
+(deftype EnqueuedRequest [^long cluster-keyslot parser args bs-args])
+(deftype Context [conn req-queue parser #_cluster-mode?])
+(def ^:dynamic *context* nil)
 (def no-context-ex
   (ex-info "Redis commands must be called within the context of a connection to Redis server (see `wcar`)" {}))
 
 ;;;; Bytes
 
-(defn ^:private -byte-str [^String s] (.getBytes s "UTF-8"))
-(def  ^:private ^:const bs-* (int (first (-byte-str "*"))))
-(def  ^:private ^:const bs-$ (int (first (-byte-str "$"))))
-(def  ^:private ^{:tag 'bytes} bs-crlf   (-byte-str "\r\n"))
-(def  ^:private ^{:tag 'bytes} bs-bin "Carmine binary data marker" (-byte-str "\u0000<"))
-(def  ^:private ^{:tag 'bytes} bs-clj "Carmine Nippy  data marker" (-byte-str "\u0000>"))
+(do
+  (defn ^:private -byte-str [^String s] (.getBytes s "UTF-8"))
+  (def  ^:private ^:const bs-* (int (first (-byte-str "*"))))
+  (def  ^:private ^:const bs-$ (int (first (-byte-str "$"))))
+  (def  ^:private bs-crlf                             (-byte-str "\r\n"))
+  (def  ^:private bs-bin "Carmine binary data marker" (-byte-str "\u0000<"))
+  (def  ^:private bs-clj "Carmine Nippy  data marker" (-byte-str "\u0000>")))
 
 (def ^:private byte-int "Cache common counts, etc."
   (let [cached (enc/memoize_ (fn [n] (-byte-str (Long/toString n))))]
@@ -52,15 +38,19 @@
     ba))
 
 ;;;; Redis<->Clj type coercion
-;; TODO Add support for pluggable serialization?
+;; TODO Pluggable serialization support?
 
-(defrecord WrappedRaw [ba])
-(defn raw "Forces byte[] argument to be sent to Redis as raw, unencoded bytes"
+(deftype WrappedRaw [ba])
+(defn raw
+  "Forces byte[] argument to be sent to Redis as raw unencoded bytes."
   [x]
   (cond
     (enc/bytes?           x) (WrappedRaw. x)
     (instance? WrappedRaw x) x
-    :else (throw (ex-info "Raw arg must be byte[]" {:x x :type (type x)}))))
+    :else
+    (throw
+      (ex-info "Raw arg must be byte[]"
+        {:given x :type (type x)}))))
 
 (defprotocol     IByteStr (byte-str [x] "Coerces arbitrary Clojure val to Redis bytestring"))
 (extend-protocol IByteStr
@@ -72,39 +62,37 @@
   Byte       (byte-str [x] (byte-int x))
   Double     (byte-str [x] (-byte-str (Double/toString x)))
   Float      (byte-str [x] (-byte-str  (Float/toString x)))
-  WrappedRaw (byte-str [x] (:ba x))
+  WrappedRaw (byte-str [x] (.-ba x))
   nil        (byte-str [x] (enc/ba-concat bs-clj (nippy-tools/freeze x)))
   Object     (byte-str [x] (enc/ba-concat bs-clj (nippy-tools/freeze x))))
 
-(extend-type (Class/forName "[B") IByteStr (byte-str [x] (enc/ba-concat bs-bin x)))
+(extend-type (Class/forName "[B")
+  IByteStr (byte-str [x] (enc/ba-concat bs-bin x)))
 
 ;;;; Basic requests
 
 (defn- send-requests
-  "Sends requests to Redis server using its byte string protocol:
+  "Sends enqueued requests to Redis server using its byte string protocol:
     *<no. of args>     crlf
     [$<size of arg N>  crlf
       <arg data>       crlf ...]"
-  ;; {:pre [(vector? requests)]}
-  [^BufferedOutputStream out requests]
+  [^BufferedOutputStream out ereqs]
   (enc/run!
-    (fn [req-args]
-      (when (pos? (count req-args)) ; [] req is dummy req for `return`
-        (let [;; TODO `meta` is unnecessarily slow here, refactor?:
-              bs-args (get (meta req-args) :bytestring-req)]
-          (.write out bs-*)
-          (.write out ^bytes (byte-int (count bs-args)))
-          (.write out bs-crlf 0 2)
-          (enc/run!
-            (fn [^bytes bs-arg]
-              (let [payload-size (alength bs-arg)]
-                (.write out bs-$)
-                (.write out ^bytes (byte-int payload-size))
-                (.write out bs-crlf 0 2)
-                (.write out bs-arg  0 payload-size) ; Payload
-                (.write out bs-crlf 0 2)))
-            bs-args))))
-    requests)
+    (fn [^EnqueuedRequest ereq]
+      (when-let [bs-args (.-bs-args ereq)] ; nil bs-args for `return`
+        (.write out bs-*)
+        (.write out ^bytes (byte-int (count bs-args)))
+        (.write out bs-crlf 0 2)
+        (enc/run!
+          (fn [^bytes bs-arg]
+            (let [payload-size (alength bs-arg)]
+              (.write out bs-$)
+              (.write out ^bytes (byte-int payload-size))
+              (.write out bs-crlf 0 2)
+              (.write out bs-arg  0 payload-size) ; Payload
+              (.write out bs-crlf 0 2)))
+          bs-args)))
+    ereqs)
   (.flush out))
 
 (defn get-unparsed-reply
@@ -195,33 +183,37 @@
         (ex-info (str "Server returned unknown reply type: " reply-type)
           {:reply-type reply-type})))))
 
-(defn get-parsed-reply "Implementation detail"
-  [^DataInputStream in ?parser]
-  (let [;; As an implementation detail, parser metadata is used as req-opts:
-        ;; {:keys [raw-bulk? thaw-opts dummy-reply :parse-exceptions?]}. We
-        ;; could instead choose to split parsers and req metadata but bundling
-        ;; the two is efficient + quite convenient in practice. Note that we
-        ;; choose to _merge_ parser metadata during parser comp.
-        req-opts (meta ?parser)
-        unparsed-reply (if-let [e (find req-opts :dummy-reply)] ; May be nil!
-                         (val e)
-                         (get-unparsed-reply in req-opts))]
+(let [not-found (Object.)]
+  (defn get-parsed-reply "Implementation detail"
+    [^DataInputStream in ?parser]
+    (if (nil? ?parser) ; Common case
+      (get-unparsed-reply in nil)
+      (let [;; As an impln detail, parser metadata is used as req-opts:
+            ;; {:keys [raw-bulk? thaw-opts dummy-reply :parse-exceptions?]}. We
+            ;; could instead choose to split parsers and req metadata but
+            ;; bundling the two is efficient + quite convenient in practice.
+            ;; Note that we choose to _merge_ parser metadata during parser
+            ;; comp. ; TODO Refactor
+            req-opts (meta ?parser)
+            unparsed-reply
+            (let [dr (get req-opts :dummy-reply not-found)]
+              (if (identical? dr not-found)
+                (get-unparsed-reply in req-opts)
+                dr))]
 
-    (if-not ?parser
-      unparsed-reply ; Common case
-      (if (and (instance? Exception unparsed-reply)
-               ;; Nb :parse-exceptions? is rare & not normally used by lib
-               ;; consumers. Such parsers need to be written to _not_
-               ;; interfere with our ability to interpret Cluster error msgs.
-               (not (:parse-exceptions? req-opts)))
+        (if (and (instance? Exception unparsed-reply)
+              ;; Nb :parse-exceptions? is rare & not normally used by lib
+              ;; consumers. Such parsers need to be written to _not_
+              ;; interfere with our ability to interpret Cluster error msgs.
+              (not (get req-opts :parse-exceptions?)))
 
-        unparsed-reply ; Return unparsed
-        (try
-          (?parser unparsed-reply)
-          (catch Exception e
-            (let [message (.getMessage e)]
-              (ex-info (str "Parser error: " message)
-                {:message message} e))))))))
+          unparsed-reply ; Return unparsed
+          (try
+            (?parser unparsed-reply)
+            (catch Exception e
+              (let [message (.getMessage e)]
+                (ex-info (str "Parser error: " message)
+                  {:message message} e)))))))))
 
 ;;;; Parsers
 
