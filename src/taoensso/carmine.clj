@@ -421,7 +421,7 @@
 
 (defn -with-new-listener
   "Implementation detail. Returns new Listener."
-  [{:keys [conn-spec init-state handler-fn body-fn]}]
+  [{:keys [conn-spec init-state handler-fn swapping-handler? body-fn]}]
   (let [state_      (atom init-state)
         handler-fn_ (atom handler-fn)
 
@@ -436,7 +436,10 @@
             (while true ; Closes when conn closes
               (let [reply (protocol/get-unparsed-reply in {})]
                 (try
-                  (when-let [hf @handler-fn_] (hf reply @state_))
+                  (when-let [hf @handler-fn_]
+                    (if swapping-handler?
+                      (swap! state_ (fn [state] (hf reply  state)))
+                      (do                       (hf reply @state_))))
                   (catch Throwable t
                     (timbre/error  t
                       "Listener handler exception")))))))]
