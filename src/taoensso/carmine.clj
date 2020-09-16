@@ -436,7 +436,7 @@
             (while true ; Closes when conn closes
               (let [reply (protocol/get-unparsed-reply in {})]
                 (try
-                  (@handler-fn_ reply @state_)
+                  (when-let [hf @handler-fn_] (hf reply @state_))
                   (catch Throwable t
                     (timbre/error  t
                       "Listener handler exception")))))))]
