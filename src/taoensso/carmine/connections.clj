@@ -23,12 +23,14 @@
 ;; conn opts  -> {:pool <pool-opts> :spec <spec-opts>} as taken by `wcar`, etc.
 
 (defprotocol IConnection
+  (-conn-error [this])
   (conn-alive? [this])
   (close-conn  [this]))
 
 (defrecord Connection [^Socket socket spec in out]
   IConnection
-  (conn-alive? [this]
+  (conn-alive? [this] (nil? (-conn-error this)))
+  (-conn-error [this]
     (try
       (let [resp
             (protocol/with-context this
@@ -36,12 +38,14 @@
                 (protocol/with-replies
                   (taoensso.carmine/ping))))]
 
-        (= resp "PONG"))
+        (when (not= resp "PONG")
+          (throw
+            (ex-info "Unexpected PING response" {:resp resp}))))
 
       (catch Exception ex
         (when-let [f (get-in spec [:instrument :on-conn-error])]
           (f {:spec spec :ex ex}))
-        false)))
+        ex)))
 
   (close-conn [_]
     (when-let [f (get-in spec [:instrument :on-conn-close])] (f {:spec spec}))

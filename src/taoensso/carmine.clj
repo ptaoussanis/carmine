@@ -421,7 +421,7 @@
 
 (defn -with-new-listener
   "Implementation detail. Returns new Listener."
-  [{:keys [conn-spec init-state handler-fn swapping-handler? body-fn]}]
+  [{:keys [conn-spec init-state handler-fn swapping-handler? body-fn error-fn]}]
   (let [state_      (atom init-state)
         handler-fn_ (atom handler-fn)
 
@@ -430,26 +430,57 @@
           (assoc (conns/conn-spec conn-spec)
             :listener? true))
 
+        error-fn
+        (fn [error-m]
+          (when-let [ef error-fn]
+            (try
+              (ef error-m)
+              true
+              (catch Throwable t
+                (timbre/error  t "Listener error-fn exception")
+                false))))
+
+        future_  (atom nil)
+        broken?_ (atom false)
+        break!
+        (fn [t]
+          (when (compare-and-set! broken?_ false true)
+            (when-let [f @future_] (future-cancel f))
+            (or
+              (error-fn {:error :connection-broken :throwable t})
+              (timbre/error "Listener connection broken"))))
+
         f
         (future-call ; Thread to long-poll for messages
           (bound-fn []
-            (while true ; Closes when conn closes
-              (when-let [reply
-                         (try
-                           (protocol/get-unparsed-reply in {})
-                           (catch java.net.SocketTimeoutException _
-                             (when-not (conns/conn-alive? conn)
-                               (throw
-                                 (IllegalStateException.
-                                   "Listener connection broken? Ping failed.")))))]
-                (try
-                  (when-let [hf @handler-fn_]
-                    (if swapping-handler?
-                      (swap! state_ (fn [state] (hf reply  state)))
-                      (do                       (hf reply @state_))))
-                  (catch Throwable t
-                    (timbre/error  t
-                      "Listener handler exception")))))))]
+            (loop []
+              (when-not @broken?_
+
+                (when-let [reply
+                           (try
+                             (protocol/get-unparsed-reply in {})
+
+                             (catch java.net.SocketTimeoutException _
+                               (when-let [ex (conns/-conn-error conn)]
+                                 (break! ex)))
+
+                             (catch Exception ex
+                               (break! ex)))]
+
+                  (try
+                    (when-let [hf @handler-fn_]
+                      (if swapping-handler?
+                        (swap! state_ (fn [state] (hf reply  state)))
+                        (do                       (hf reply @state_))))
+
+                    (catch Throwable t
+                      (or
+                        (error-fn {:error :handler-exception :throwable t})
+                        (timbre/error t "Listener handler exception")))))
+
+                (recur)))))]
+
+    (reset! future_ f)
 
     (protocol/with-context conn (body-fn)
        (protocol/execute-requests (not :get-replies) nil))
