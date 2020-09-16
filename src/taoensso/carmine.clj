@@ -434,7 +434,14 @@
         (future-call ; Thread to long-poll for messages
           (bound-fn []
             (while true ; Closes when conn closes
-              (let [reply (protocol/get-unparsed-reply in {})]
+              (when-let [reply
+                         (try
+                           (protocol/get-unparsed-reply in {})
+                           (catch java.net.SocketTimeoutException _
+                             (when-not (conns/conn-alive? conn)
+                               (throw
+                                 (IllegalStateException.
+                                   "Listener connection broken? Ping failed.")))))]
                 (try
                   (when-let [hf @handler-fn_]
                     (if swapping-handler?
