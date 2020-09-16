@@ -29,17 +29,19 @@
 (defrecord Connection [^Socket socket spec in out]
   IConnection
   (conn-alive? [this]
-    (if (:listener? spec)
-      true ; TODO Waiting on Ref. http://goo.gl/LPhIO
-      (= "PONG"
-        (try
-          (protocol/with-context this
-            (protocol/with-replies
-              (taoensso.carmine/ping)))
+    (try
+      (let [resp
+            (protocol/with-context this
+              (taoensso.carmine/parse nil
+                (protocol/with-replies
+                  (taoensso.carmine/ping))))]
 
-          (catch Exception ex
-            (when-let [f (get-in spec [:instrument :on-conn-error])]
-              (f {:spec spec :ex ex})))))))
+        (= resp "PONG"))
+
+      (catch Exception ex
+        (when-let [f (get-in spec [:instrument :on-conn-error])]
+          (f {:spec spec :ex ex}))
+        false)))
 
   (close-conn [_]
     (when-let [f (get-in spec [:instrument :on-conn-close])] (f {:spec spec}))
