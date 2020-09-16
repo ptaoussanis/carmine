@@ -415,7 +415,7 @@
 
 (declare close-listener)
 
-(defrecord Listener [connection handler state future]
+(defrecord Listener [connection handler state future id]
   java.io.Closeable
   (close [this] (close-listener this)))
 
@@ -437,8 +437,8 @@
 
 (defn -with-new-listener
   "Implementation detail. Returns new Listener."
-  [{:keys [conn-spec init-state handler-fn swapping-handler? body-fn error-fn
-           keep-alive-ms]}]
+  [{:keys [conn-spec init-state handler-fn body-fn listener-id]
+    :or   {listener-id (enc/uuid-str)}}]
 
   (let [state_      (atom init-state)
         handler-fn_ (atom handler-fn)
@@ -448,29 +448,43 @@
           (assoc (conns/conn-spec conn-spec)
             :listener? true))
 
-        keep-alive-fn
+        {:keys [keep-alive-ms]} conn-spec
+        ?keep-alive-fn
         (when-let [ms keep-alive-ms]
           (get-keep-alive-fn ms))
 
-        error-fn
-        (fn [error-m]
-          (when-let [ef error-fn]
-            (try
-              (ef error-m)
-              true
-              (catch Throwable t
-                (timbre/error  t "Listener error-fn exception")
-                false))))
+        handle
+        (fn [reply]
+          (when-let [hf @handler-fn_]
+            (if (:swapping-handler? (meta hf))
+              (swap! state_ (fn [state] (hf reply  state)))
+              (do                       (hf reply @state_)))))
 
-        future_  (atom nil)
+        future_   (atom nil)
+        listener_ (atom nil)
+
+        handle-error
+        (fn [error throwable]
+          (try
+            (handle ["carmine:error" "carmine:listener:error"
+                     {:error     error
+                      :throwable throwable
+                      :listener  @listener_}])
+            true
+            (catch Throwable t
+              (timbre/error  t "Listener (error) handler exception")
+              false)))
+
         broken?_ (atom false)
         break!
         (fn [t]
           (when (compare-and-set! broken?_ false true)
             (when-let [f @future_] (future-cancel f))
             (or
-              (error-fn {:error :connection-broken :throwable t})
-              (timbre/error "Listener connection broken"))))
+              (handle-error :connection-broken t)
+              (if t
+                (timbre/error t "Listener connection broken")
+                (timbre/error   "Listener connection broken")))))
 
         msg-polling-future
         (future-call
@@ -478,27 +492,23 @@
             (loop []
               (when-not @broken?_
 
-                (when-let [kaf keep-alive-fn] (kaf)) ; Record activity on conn
+                (when-let [kaf ?keep-alive-fn] (kaf)) ; Record activity on conn
                 (when-let [reply
                            (try
                              (protocol/get-unparsed-reply in {})
 
                              (catch java.net.SocketTimeoutException _
-                               (if-let [ex (conns/-conn-error conn)]
+                               (when-let [ex (conns/-conn-error conn)]
                                  (break! ex)))
 
                              (catch Exception ex
                                (break! ex)))]
 
                   (try
-                    (when-let [hf @handler-fn_]
-                      (if swapping-handler?
-                        (swap! state_ (fn [state] (hf reply  state)))
-                        (do                       (hf reply @state_))))
-
+                    (handle reply)
                     (catch Throwable t
                       (or
-                        (error-fn {:error :handler-exception :throwable t})
+                        (handle-error :handler-exception t)
                         (timbre/error t "Listener handler exception")))))
 
                 (recur)))))]
@@ -508,7 +518,7 @@
     (protocol/with-context conn (body-fn)
       (protocol/execute-requests (not :get-replies) nil))
 
-    (when-let [kaf keep-alive-fn]
+    (when-let [kaf ?keep-alive-fn]
       (let [f
             (bound-fn []
               (loop []
@@ -524,7 +534,9 @@
           (.setDaemon true)
           (.start))))
 
-    (Listener. conn handler-fn_ state_ msg-polling-future)))
+    (let [listener (Listener. conn handler-fn_ state_ msg-polling-future listener-id)]
+      (reset! listener_ listener)
+      (do               listener))))
 
 (defmacro with-new-listener
   "Creates a persistent[1] connection to Redis server and a thread to listen for
@@ -570,9 +582,15 @@
      :body-fn    body-fn
      :handler-fn
      (fn [msg state]
-       (let [[_msg-type chan-or-pattern _msg-content] msg]
-         (when-let [hf (clojure.core/get msg-handler-fns chan-or-pattern)]
-           (hf msg))))}))
+       (let [[msg-type chan-or-pattern msg-content] msg]
+         (if-let [hf (clojure.core/get msg-handler-fns chan-or-pattern)]
+           (hf msg)
+
+           ;; TODO Is this sensible?
+           ;; Ensure :carmine:listener:error is sent to "*" handler
+           (when (= chan-or-pattern :carmine:listener:error)
+             (when-let [hf (clojure.core/get msg-handler-fns "*")]
+               (hf [msg-type "*" msg-content]))))))}))
 
 (defmacro with-new-pubsub-listener
   "A wrapper for `with-new-listener`.
@@ -601,6 +619,20 @@
      {:conn-spec       ~conn-spec
       :msg-handler-fns ~message-handlers
       :body-fn         (fn [] ~@subscription-commands)}))
+
+(comment
+  (def listener-1
+    (with-new-pubsub-listener {}
+      {"throw" (fn [x] (/ 1 0))
+       "okay"  (fn [x] (println ["okay" x]))
+       "*"     (fn [x] (println ["*"    x]))}
+
+      (psubscribe "throw" "okay" "*")))
+
+  (close-listener listener-1)
+
+  (wcar {} (publish "okay"  "msg"))
+  (wcar {} (publish "throw" "msg")))
 
 ;;;; Atomic macro
 ;; The design here's a little on the heavy side; I'd suggest instead reaching
